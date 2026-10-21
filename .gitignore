@@ -42,3 +42,15 @@ profile/*
 logs/*
 private/*
 .DS_Store
+
+# ACGuard: Visual Studio build outputs
+bin_win32/ac_client.exe
+bin_win32/ac_server.exe
+bin_win32/*.pdb
+source/vcpp/Release/
+source/vcpp/Debug/
+source/vcpp/Profile/
+source/vcpp/Standalone/
+source/vcpp/*.user
+source/vcpp/.vs/
+*.obj
