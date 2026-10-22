@@ -804,13 +804,38 @@ static CanaryBlock accanary[AC_CANARYN] =
 };
 static unsigned char accanarystatic[AC_CANARYBYTES];
 static int accanaryevents[AC_CANARYN], accanaryreseeds[AC_CANARYN];
-static bool accanarydemo[AC_CANARYN];       // the next mismatch in this block was made by the demo command
+enum { AC_DEMO_NONE = 0, AC_DEMO_COMMAND, AC_DEMO_ENV };
+static int accanarydemo[AC_CANARYN];        // the next mismatch in this block was made on purpose, and by what
 static bool accanaryarmed = false;
 static string acsession;                    // per-process random hex (16 digits): finding ids stay unique across restarts
 static unsigned int acsessionlo = 0;
 static string acgamefindingspath;
 static DWORD accanarylast = 0, acdemostart = 0;
-static int acdemoblock = 0, acdemotrips = 0;
+#define AC_DEMOMAX      8
+static int acdemolist[AC_DEMOMAX], acdemocount = 0, acdemodone = 0;   // ACGUARD_DEMO_TRIP blocks, tripped 4 s apart
+
+// flood control: after AC_FLOODN events on one block within AC_FLOODMS, one more line says so and the block's
+// further events are counted but not written until AC_FLOODMS has passed (keeps the console usable if a block is stuck)
+#define AC_FLOODN       5
+#define AC_FLOODMS      60000
+static DWORD acfloodtimes[AC_CANARYN][AC_FLOODN], acflooduntil[AC_CANARYN];
+static int acfloodcount[AC_CANARYN], acfloodsuppressed[AC_CANARYN];
+static bool acflooding[AC_CANARYN];
+
+// per-block wording (index = block id - 1): where the block is kept, and why a game bug is or is not ruled out
+static const char *acwherekept[AC_CANARYN] = { "beside its player state", "in static memory", "in a private page" };
+static const char *acbughypothesis[AC_CANARYN] =
+{
+    "A game bug writing past the end of its player state.",
+    "A game bug writing out of bounds.",
+    "A game bug writing out of bounds.",
+};
+static const char *acbugruling[AC_CANARYN] =
+{
+    "Unlikely (the block is never referenced by game code), though the block is adjacent to player state by design.",
+    "Ruled out: the block is never referenced by game code and is not adjacent to any game data.",
+    "Ruled out: the block is never referenced by game code and is not adjacent to any game data.",
+};
 
 // block 1: called from clientgame.cpp right after "playerent *player1 = newplayerent();" (static initialisation),
 // so it is new'd next to player1 on the same heap
@@ -856,13 +881,18 @@ static void accanaryinit()
     long dist = long((size_t)accanary[0].p) - long((size_t)player1);
     conoutf("ACGuard canary: %d blocks armed, checked every %d s (block 1 is %ld bytes from player1)", armed, AC_CANARYMS / 1000, dist);
 
-    char env[16];
+    // demo aid: ACGUARD_DEMO_TRIP=<block>[,<block>...] trips those blocks in turn, 4 s apart, from 3 s after start
+    char env[64];
     DWORD n = GetEnvironmentVariableA("ACGUARD_DEMO_TRIP", env, sizeof(env));
-    if(n > 0 && n < sizeof(env) && atoi(env) >= 1 && atoi(env) <= AC_CANARYN)
-    {   // demo aid: trips that block 3 s and 7 s after start, to show one finding per event
-        acdemoblock = atoi(env);
-        acdemostart = GetTickCount();
-        conoutf("ACGuard canary: ACGUARD_DEMO_TRIP=%d - block %d will be corrupted on purpose twice", acdemoblock, acdemoblock);
+    if(n > 0 && n < sizeof(env))
+    {
+        for(const char *p = env; *p && acdemocount < AC_DEMOMAX; p++)
+            if(*p >= '1' && *p < '1' + AC_CANARYN) acdemolist[acdemocount++] = *p - '0';
+        if(acdemocount)
+        {
+            acdemostart = GetTickCount();
+            conoutf("ACGuard canary: ACGUARD_DEMO_TRIP=%s - %d demo corruption%s, 4 s apart, from 3 s after start", env, acdemocount, acdemocount == 1 ? "" : "s");
+        }
     }
 }
 
@@ -906,9 +936,28 @@ static bool acappendline(const char *path, const char *line, int len)
 
 static void accanaryevent(CanaryBlock &b, int differ, size_t first, unsigned char expected, unsigned char observed)
 {
-    int ev = ++accanaryevents[b.id - 1];
-    bool demo = accanarydemo[b.id - 1];
-    accanarydemo[b.id - 1] = false;
+    int bi = b.id - 1;
+    int ev = ++accanaryevents[bi];
+    int demo = accanarydemo[bi];
+    accanarydemo[bi] = AC_DEMO_NONE;
+
+    // flood control
+    DWORD now = GetTickCount();
+    if(acflooding[bi])
+    {
+        if(int(now - acflooduntil[bi]) < 0) { acfloodsuppressed[bi]++; return; }   // counted, not written
+        acflooding[bi] = false;
+        if(acfloodsuppressed[bi])
+            conoutf("ACGuard canary: %d further event%s on block %d %s not written in the last %d s", acfloodsuppressed[bi],
+                    acfloodsuppressed[bi] == 1 ? "" : "s", b.id, acfloodsuppressed[bi] == 1 ? "was" : "were", AC_FLOODMS / 1000);
+        acfloodsuppressed[bi] = 0;
+        acfloodcount[bi] = 0;               // a fresh window
+    }
+    // the oldest of the last AC_FLOODN events is in the slot about to be overwritten
+    bool floodnow = acfloodcount[bi] >= AC_FLOODN && now - acfloodtimes[bi][acfloodcount[bi] % AC_FLOODN] < DWORD(AC_FLOODMS);
+    acfloodtimes[bi][acfloodcount[bi] % AC_FLOODN] = now;
+    acfloodcount[bi]++;
+    if(floodnow) { acflooding[bi] = true; acflooduntil[bi] = now + AC_FLOODMS; }
 
     SYSTEMTIME st;
     GetSystemTime(&st);
@@ -921,10 +970,13 @@ static void accanaryevent(CanaryBlock &b, int differ, size_t first, unsigned cha
                         b.id, b.where, int(b.n), (unsigned long)(size_t)b.p, b.seed, at, differ, int(first), expected, observed);
     char summary[1024];
     _snprintf_s(summary, sizeof(summary), _TRUNCATE,
-        "A sentinel block the game keeps beside its player state changed (block %d, %s, %d of %d bytes differ, first at offset %d). "
+        "A sentinel block the game keeps %s changed (block %d, %s, %d of %d bytes differ, first at offset %d). "
         "Nothing in the game writes this block; a write from outside the process is the only expected cause. "
-        "This canary detects writes only; reads are invisible.%s",
-        b.id, b.where, differ, int(b.n), int(first), demo ? " This event was made on purpose by the anticheat_tripcanary demo command." : "");
+        "This canary detects writes only; reads are invisible.%s%s",
+        acwherekept[bi], b.id, b.where, differ, int(b.n), int(first),
+        demo == AC_DEMO_COMMAND ? " This event was made on purpose by the /anticheat_tripcanary demo command." :
+        (demo == AC_DEMO_ENV ? " This event was made on purpose by the ACGUARD_DEMO_TRIP demo setting." : ""),
+        floodnow ? " (further events on this block are suppressed for 60 s)" : "");
     string evref;
     formatstring(evref)("game-findings.jsonl#%s", fid);
 
@@ -949,8 +1001,8 @@ static void accanaryevent(CanaryBlock &b, int differ, size_t first, unsigned cha
     jwraw(w, "}]");
     jwkv(w, "conflict", "The block changed, yet no code in the game references it.");
     jwkey(w, "benign_explanations_considered"); jwraw(w, "[{");
-    jwkey(w, "hypothesis", true); jwstr(w, "A game bug writing out of bounds.");
-    jwkv(w, "ruled_out_by", "Ruled out: the block is never referenced by game code.");
+    jwkey(w, "hypothesis", true); jwstr(w, acbughypothesis[bi]);
+    jwkv(w, "ruled_out_by", acbugruling[bi]);
     jwraw(w, "},{");
     jwkey(w, "hypothesis", true); jwstr(w, "Memory corruption by a crashed thread.");
     jwkv(w, "ruled_out_by", "Not ruled out.");
@@ -990,18 +1042,18 @@ static void accanarycheck()
     }
 }
 
-static void actripcanary(int id)           // demo only: a deliberate write into block id
+static void actripcanary(int id, int how)  // demo only: a deliberate write into block id
 {
     CanaryBlock &b = accanary[id - 1];
     if(!b.p) return;
     loopi(16) b.p[128 + i] ^= 0x5A;
-    accanarydemo[id - 1] = true;
+    accanarydemo[id - 1] = how;
 }
 
 static void accanaryupdate(DWORD now)
 {
     if(!accanaryarmed) return;
-    if(acdemoblock && acdemotrips < 2 && now - acdemostart >= DWORD(acdemotrips ? 7000 : 3000)) { actripcanary(acdemoblock); acdemotrips++; }
+    if(acdemodone < acdemocount && now - acdemostart >= DWORD(3000 + 4000 * acdemodone)) actripcanary(acdemolist[acdemodone++], AC_DEMO_ENV);
     if(now - accanarylast < AC_CANARYMS) return;
     accanarylast = now;
     accanarycheck();
@@ -1018,7 +1070,7 @@ static void accanarystatus()               // one line for /anticheat
 void anticheat_tripcanary(int *id)
 {
     if(!accanaryarmed || *id < 1 || *id > AC_CANARYN || !accanary[*id - 1].p) { conoutf("usage: /anticheat_tripcanary 1|2|3 (demo: corrupts a canary block on purpose)"); return; }
-    actripcanary(*id);
+    actripcanary(*id, AC_DEMO_COMMAND);
     conoutf("ACGuard canary: block %d corrupted on purpose (demo); the next check (within %d s) reports it", *id, AC_CANARYMS / 1000);
 }
 COMMAND(anticheat_tripcanary, "i");
@@ -1038,6 +1090,7 @@ void anticheat(char *arg)
         conoutf("  Memory canary: 3 sentinel blocks checked every 2 s; a change is written to game-findings.jsonl.");
         conoutf("  It detects writes into the game's memory only; reads leave no trace.");
         conoutf("  demo: /anticheat_tripcanary 1|2|3 corrupts a canary block on purpose; the next check reports it.");
+        conoutf("  demo: env ACGUARD_DEMO_TRIP=<b>[,<b>...] corrupts those blocks at startup, 4 s apart.");
         return;
     }
     bool full = arg && !strcmp(arg, "full");
