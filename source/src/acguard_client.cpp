@@ -1,4 +1,4 @@
-// anticheat.cpp: ACGuard status inside the client: the /anticheat console command and a one-line HUD.
+// acguard_client.cpp: ACGuard status inside the client: the /anticheat console command and a one-line HUD.
 //
 // Read-only by design. The ACGuard service (a separate Windows service) scans the PCI bus and writes status.json
 // (replaced atomically after each scan) and findings.jsonl (append-only, one JSON finding per line) to its output
@@ -8,7 +8,7 @@
 // No JSON library: a small tolerant reader below extracts only the named top-level fields.
 
 #include "cube.h"
-#include "anticheat.h"
+#include "acguard_client.h"
 
 VARP(anticheat_hud, 0, 1, 1);
 
@@ -23,8 +23,15 @@ VARP(anticheat_hud, 0, 1, 1);
 #define AC_MAXENTRIES   64      // flagged devices shown
 #define AC_STATUSMAX    (64*1024)
 #define AC_CHUNK        (256*1024)      // findings.jsonl is read in chunks of this size (a line is at most 64 KiB)
-#define AC_CHUNKSPERPOLL 16             // at most 4 MiB of new findings per poll, the rest on the next poll
+#define AC_CHUNKSPERPOLL 16             // during play: at most 4 MiB of new findings per poll, the rest on the next poll
+#define AC_STARTUPMAX   (128*1024*1024) // at startup the whole file is read before the main loop, but at most its last 128 MiB
 #define AC_MAXCOUNTS    8
+
+#define AC_CANARYRULE   "CAN-"      // a game-origin finding counts only inside the game's namespace: a CAN- rule on a
+#define AC_GAMEKEY      "game:"     // game: device key (ACGuard FindingValidation.IsInCanaryNamespace)
+
+enum { S_INFO = 0, S_LOW, S_MEDIUM, S_HIGH, S_NUM };
+static const char *acseveritynames[S_NUM] = { "info", "low", "medium", "high" };     // ACGuard Severity order
 
 enum { V_KNOWN_GOOD = 0, V_UNUSUAL_PLAUSIBLE, V_INSUFFICIENT_EVIDENCE, V_ANOMALOUS, V_INTERNALLY_INCONSISTENT, V_NUM };
 // rank order as in ACGuard's VerdictOrder.Rank: the index; anything else ranks -1
@@ -43,14 +50,18 @@ struct acstatus
 
 struct acfinding
 {
-    char ruleid[32], devicekey[64], label[128], sessionid[64];
-    int rank;
-    float conf;
+    char ruleid[32], label[128];
+    string devicekey, sessionid;
+    bool keycut, sessioncut;        // value longer than the buffer: never matches anything
+    int rank, severity;
+    double conf;
     bool game;
     char summary[1024];
 };
 
-struct acentry { int setter, others; };    // one flagged device: the verdict-setting finding + how many other rules
+// one flagged device: the finding that sets its verdict (highest verdict, then confidence; shown in the header),
+// the finding that orders it among devices (highest confidence, then severity; report.md's g[0]), other rules
+struct acentry { int setter, lead, others; };
 
 static string acdir, acstatuspath, acfindingspath;
 static bool acinited = false;
@@ -61,6 +72,7 @@ static acentry acentries[AC_MAXENTRIES];
 static int acnumentries = 0, acnumflagged = 0, acworstrank = -1;
 static DWORD aclastpoll = 0, acretryat = 0;
 static bool acpolled = false, acretrypending = false;
+static string achudline;            // the HUD text, rebuilt once per poll so drawing does no time math per frame
 
 // ---------------------------------------------------------------------------------------------------------------
 // minimal tolerant JSON reading: [p, e) ranges, no NUL terminator needed
@@ -176,7 +188,9 @@ static int jhex4(const char *p, const char *e, unsigned int &c)
     return 4;
 }
 
-static void jputc(char *d, int &len, int maxlen, char c) { if(len < maxlen - 1) d[len++] = c; }
+static bool jcut = false;           // set when the current jstring() dropped characters for lack of room
+
+static void jputc(char *d, int &len, int maxlen, char c) { if(len < maxlen - 1) d[len++] = c; else jcut = true; }
 
 static void jputcode(char *d, int &len, int maxlen, unsigned int c)
 {
@@ -185,10 +199,12 @@ static void jputcode(char *d, int &len, int maxlen, unsigned int c)
     else for(const char *s = jascii(c); *s; s++) jputc(d, len, maxlen, *s);
 }
 
-// a JSON string value, unescaped to printable ASCII; false (and "") if v is not a string
-static bool jstring(const jmember *m, char *d, int maxlen)
+// a JSON string value, unescaped to printable ASCII; false (and "") if v is not a string; *cut: it did not fit
+static bool jstring(const jmember *m, char *d, int maxlen, bool *cut = NULL)
 {
     d[0] = '\0';
+    jcut = false;
+    if(cut) *cut = false;
     if(!m || m->val >= m->valend || *m->val != '"') return false;
     const char *p = m->val + 1, *e = m->valend - 1;     // without the quotes
     int len = 0;
@@ -234,6 +250,7 @@ static bool jstring(const jmember *m, char *d, int maxlen)
         else { jputcode(d, len, maxlen, ch); p++; }
     }
     d[len] = '\0';
+    if(cut) *cut = jcut;
     return true;
 }
 
@@ -270,6 +287,12 @@ static bool jbool(const jmember *m)
 static int verdictrank(const char *v)
 {
     loopi(V_NUM) if(!strcmp(v, acverdictnames[i])) return i;
+    return -1;
+}
+
+static int severityrank(const char *s)
+{
+    loopi(S_NUM) if(!strcmp(s, acseveritynames[i])) return i;
     return -1;
 }
 
@@ -381,7 +404,9 @@ static int readstatus(acstatus &s)
     double v;
     if(jnumber(jfind(m, n, "device_count"), v)) s.devices = int(v);
     jstring(jfind(m, n, "last_scan_utc"), s.scanutc, MAXSTRLEN);
-    jstring(jfind(m, n, "last_scan_id"), s.scanid, MAXSTRLEN);
+    bool idcut = false;
+    jstring(jfind(m, n, "last_scan_id"), s.scanid, MAXSTRLEN, &idcut);
+    if(idcut) s.scanid[0] = '\0';       // too long to compare: matches no finding
     const jmember *vc = jfind(m, n, "verdict_counts");
     if(vc)
     {
@@ -423,13 +448,15 @@ static void addfindingline(const char *p, const char *e)
     acfinding &f = acfindings[acnumfindings];
     memset(&f, 0, sizeof(f));
     f.rank = rank;
-    double conf = 0;
-    jnumber(jfind(m, n, "confidence"), conf);
-    f.conf = float(conf);
+    f.conf = 0;
+    jnumber(jfind(m, n, "confidence"), f.conf);
+    char severity[16];
+    jstring(jfind(m, n, "severity"), severity, sizeof(severity));
+    f.severity = severityrank(severity);
     jstring(jfind(m, n, "rule_id"), f.ruleid, sizeof(f.ruleid));
-    jstring(jfind(m, n, "device_key"), f.devicekey, sizeof(f.devicekey));
+    jstring(jfind(m, n, "device_key"), f.devicekey, sizeof(f.devicekey), &f.keycut);
     jstring(jfind(m, n, "device_label"), f.label, sizeof(f.label));
-    jstring(jfind(m, n, "session_id"), f.sessionid, sizeof(f.sessionid));
+    jstring(jfind(m, n, "session_id"), f.sessionid, sizeof(f.sessionid), &f.sessioncut);
     jstring(jfind(m, n, "summary"), f.summary, sizeof(f.summary));
     char origin[16];
     jstring(jfind(m, n, "origin"), origin, sizeof(origin));    // absent on old lines: a service finding
@@ -437,46 +464,63 @@ static void addfindingline(const char *p, const char *e)
     acnumfindings++;
 }
 
-// reads what was appended to findings.jsonl since the last poll; starts over if the file was replaced or shrank
-static void tailfindings()
+// findings.jsonl read position: the file is identified by volume + file index, so a replaced file starts over
+static LONGLONG actailoffset = 0;
+static DWORD actailvol = 0, actailidxhi = 0, actailidxlo = 0;
+static bool actailknown = false, actailskippartial = false;
+
+// reads up to maxchunks chunks of what was appended to findings.jsonl since the last call; starts over if the file
+// was replaced or shrank (from its last AC_STARTUPMAX bytes if it is larger). Returns true when there is nothing
+// more to read right now (end of file, a line still being written, or the file cannot be read).
+static bool tailfindings(int maxchunks)
 {
     static char chunk[AC_CHUNK];
-    static LONGLONG offset = 0;
-    static DWORD vol = 0, idxhi = 0, idxlo = 0;
-    static bool known = false;
-
     int result;
     HANDLE h = acopen(acfindingspath, result);
     if(result != RD_OK)
     {
-        if(result == RD_MISSING) { clearfindings(); known = false; offset = 0; }
-        return;                         // RD_FAILED: keep what we have, try again next poll
+        if(result == RD_MISSING) { clearfindings(); actailknown = false; actailoffset = 0; }
+        return true;                    // RD_FAILED: keep what we have, try again next poll
     }
     BY_HANDLE_FILE_INFORMATION fi;
-    if(!GetFileInformationByHandle(h, &fi)) { CloseHandle(h); return; }
+    if(!GetFileInformationByHandle(h, &fi)) { CloseHandle(h); return true; }
     LONGLONG size = LONGLONG(((ULONGLONG)fi.nFileSizeHigh << 32) | fi.nFileSizeLow);
-    if(!known || fi.dwVolumeSerialNumber != vol || fi.nFileIndexHigh != idxhi || fi.nFileIndexLow != idxlo || size < offset)
+    if(!actailknown || fi.dwVolumeSerialNumber != actailvol || fi.nFileIndexHigh != actailidxhi || fi.nFileIndexLow != actailidxlo || size < actailoffset)
     {
         clearfindings();
-        offset = 0;
-        known = true;
-        vol = fi.dwVolumeSerialNumber; idxhi = fi.nFileIndexHigh; idxlo = fi.nFileIndexLow;
+        actailoffset = 0;
+        actailskippartial = false;
+        actailknown = true;
+        actailvol = fi.dwVolumeSerialNumber; actailidxhi = fi.nFileIndexHigh; actailidxlo = fi.nFileIndexLow;
+        if(size > AC_STARTUPMAX)
+        {   // start from the last 128 MiB, at the first line boundary in it
+            actailoffset = size - AC_STARTUPMAX;
+            actailskippartial = true;
+            conoutf("ACGuard: findings.jsonl is %d MiB; reading only its last %d MiB", int(size >> 20), AC_STARTUPMAX >> 20);
+        }
     }
-    loopk(AC_CHUNKSPERPOLL)
+    bool done = false;
+    loopk(maxchunks)
     {
-        if(offset >= size) break;
-        DWORD want = DWORD(min(size - offset, LONGLONG(AC_CHUNK))), got = 0;
+        if(actailoffset >= size) { done = true; break; }
+        DWORD want = DWORD(min(size - actailoffset, LONGLONG(AC_CHUNK))), got = 0;
         LARGE_INTEGER pos;
-        pos.QuadPart = offset;
-        if(!SetFilePointerEx(h, pos, NULL, FILE_BEGIN) || !ReadFile(h, chunk, want, &got, NULL) || !got) break;
+        pos.QuadPart = actailoffset;
+        if(!SetFilePointerEx(h, pos, NULL, FILE_BEGIN) || !ReadFile(h, chunk, want, &got, NULL) || !got) { done = true; break; }
         int last = int(got) - 1;
         while(last >= 0 && chunk[last] != '\n') last--;
         if(last < 0)
         {   // no complete line in this chunk
-            if(got == AC_CHUNK) { offset += got; continue; }   // an over-long line: skipped (its rest fails to parse)
-            break;                                              // a line still being written: next poll
+            if(got == AC_CHUNK) { actailoffset += got; continue; }  // an over-long line (or the skipped partial one): dropped
+            done = true;                                            // a line still being written: next poll
+            break;
         }
         const char *p = chunk, *end = chunk + last + 1;
+        if(actailskippartial)
+        {   // the first line of a mid-file start is a fragment
+            p = (const char *)memchr(chunk, '\n', end - chunk) + 1;
+            actailskippartial = false;
+        }
         while(p < end)
         {
             const char *nl = (const char *)memchr(p, '\n', end - p);
@@ -484,24 +528,42 @@ static void tailfindings()
             if(nl > p) addfindingline(p, nl);
             p = nl + 1;
         }
-        offset += last + 1;
+        actailoffset += last + 1;
     }
+    if(actailoffset >= size) done = true;
     CloseHandle(h);
+    return done;
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-// roll-up, as report.md's Flagged section: this scan's findings (and any the game reported), one entry per device,
-// the device's verdict set by its highest verdict then highest confidence; entries by verdict, confidence, label
+// roll-up, as report.md's Flagged section (ACGuard ScanPipeline.ReportFindings + ReportWriter.Flagged):
+// - in scope: a service finding of the last scan, or a game finding inside the game's namespace (CAN- rule on a
+//   game: device key; any other game line is ignored, so a forged one can never join a real device's entry)
+// - one entry per device; its header shows the setter (highest verdict, then highest confidence)
+// - entries ordered by their lead finding (highest confidence, then severity; first in file order on a tie):
+//   confidence desc, severity desc, then label
 
 static bool inscope(const acfinding &f)
 {
-    return f.game || (acst.scanid[0] && !strcmp(f.sessionid, acst.scanid));
+    if(f.game) return !f.keycut && !strncmp(f.ruleid, AC_CANARYRULE, strlen(AC_CANARYRULE)) && !strncmp(f.devicekey, AC_GAMEKEY, strlen(AC_GAMEKEY));
+    return acst.scanid[0] && !f.sessioncut && !strcmp(f.sessionid, acst.scanid);
 }
 
-static bool betterthan(const acfinding &a, const acfinding &b)
+static bool samedevice(const acfinding &a, const acfinding &b)
+{
+    return !a.keycut && !b.keycut && !strcmp(a.devicekey, b.devicekey);    // a cut key matches nothing
+}
+
+static bool setsverdict(const acfinding &a, const acfinding &b)     // a beats b as the device's verdict-setting rule
 {
     if(a.rank != b.rank) return a.rank > b.rank;
     return a.conf > b.conf;
+}
+
+static bool leads(const acfinding &a, const acfinding &b)           // a orders before b (confidence, then severity)
+{
+    if(a.conf != b.conf) return a.conf > b.conf;
+    return a.severity > b.severity;
 }
 
 static void acrebuild()
@@ -516,15 +578,19 @@ static void acrebuild()
         const acfinding &f = acfindings[i];
         if(!inscope(f)) continue;
         int e = -1;
-        loopj(acnumentries) if(!strcmp(acfindings[acentries[j].setter].devicekey, f.devicekey)) { e = j; break; }
+        loopj(acnumentries) if(samedevice(acfindings[acentries[j].setter], f)) { e = j; break; }
         if(e < 0)
         {
             if(acnumentries >= AC_MAXENTRIES) continue;
             e = acnumentries++;
-            acentries[e].setter = i;
+            acentries[e].setter = acentries[e].lead = i;
             acentries[e].others = 0;
         }
-        else if(betterthan(f, acfindings[acentries[e].setter])) acentries[e].setter = i;
+        else
+        {
+            if(setsverdict(f, acfindings[acentries[e].setter])) acentries[e].setter = i;
+            if(leads(f, acfindings[acentries[e].lead])) acentries[e].lead = i;
+        }
         owner[i] = e;
     }
     // other contributing rules per device: distinct rule ids besides the setter's
@@ -536,24 +602,25 @@ static void acrebuild()
         loopj(i) if(owner[j] == owner[i] && !strcmp(acfindings[j].ruleid, acfindings[i].ruleid)) { seen = true; break; }
         if(!seen) en.others++;
     }
-    // insertion sort: verdict rank, confidence (both descending), then label
+    // stable insertion sort by the lead finding: confidence, severity (both descending), then label (ordinal);
+    // entries start in first-appearance order, as LINQ's GroupBy, so full ties keep it
     for(int i = 1; i < acnumentries; i++)
     {
         acentry x = acentries[i];
-        const acfinding &fx = acfindings[x.setter];
+        const acfinding &fx = acfindings[x.lead];
         int j = i - 1;
         while(j >= 0)
         {
-            const acfinding &fj = acfindings[acentries[j].setter];
-            bool after = betterthan(fx, fj) || (!betterthan(fj, fx) && strcmp(fx.label, fj.label) < 0);
-            if(!after) break;
+            const acfinding &fj = acfindings[acentries[j].lead];
+            bool before = leads(fx, fj) || (!leads(fj, fx) && strcmp(fx.label, fj.label) < 0);
+            if(!before) break;
             acentries[j + 1] = acentries[j];
             j--;
         }
         acentries[j + 1] = x;
     }
     acnumflagged = acnumentries;
-    if(acnumentries) acworstrank = acfindings[acentries[0].setter].rank;
+    loopi(acnumentries) acworstrank = max(acworstrank, acfindings[acentries[i].setter].rank);
 }
 
 // ---------------------------------------------------------------------------------------------------------------
@@ -569,11 +636,14 @@ static void pollstatus(bool isretry)
     // RD_FAILED twice (mid-replace, locked, cut off): keep the previous state
 }
 
+static void acrefreshhud();
+
 static void acpoll()
 {
     pollstatus(false);
-    tailfindings();
+    tailfindings(AC_CHUNKSPERPOLL);     // during play: at most 4 MiB per poll
     acrebuild();
+    acrefreshhud();
 }
 
 void anticheat_init()
@@ -590,6 +660,9 @@ void anticheat_init()
     acinited = true;
     bool found = GetFileAttributesA(acstatuspath) != INVALID_FILE_ATTRIBUTES;
     conoutf("ACGuard status: %s (%s)", acdir, found ? "found" : "not found");
+    // startup catch-up, before the main loop: the whole findings.jsonl (at most its last 128 MiB), so the first
+    // frames already show the right flagged count; the loop guard is only a backstop for a file growing meanwhile
+    for(int guard = 0; guard < 2 * (AC_STARTUPMAX / (AC_CHUNK * AC_CHUNKSPERPOLL)) && !tailfindings(AC_CHUNKSPERPOLL); guard++);
     acpoll();
     aclastpoll = GetTickCount();
     acpolled = true;
@@ -606,6 +679,7 @@ void anticheat_update()
             acretrypending = false;
             pollstatus(true);
             acrebuild();
+            acrefreshhud();
         }
         return;
     }
@@ -626,6 +700,16 @@ static void acstatusline(char *buf)   // shared by the HUD and /anticheat; ASCII
     string age;
     scanage(age);
     formatstring(buf)("ACGuard: driver %s - %d devices - %d flagged - scan %s ago", acst.driver ? "yes" : "no", acst.devices, acnumflagged, age);
+}
+
+// the HUD line with its colour: grey without a scan, yellow when something is flagged, red when ANOMALOUS or worse,
+// else white; rebuilt after every poll (once a second), so drawing it costs no time math
+static void acrefreshhud()
+{
+    string line;
+    acstatusline(line);
+    char colour = !acst.valid ? '4' : (acworstrank >= V_ANOMALOUS ? '3' : (acnumflagged ? '2' : '5'));
+    formatstring(achudline)("\f%c%s", colour, line);
 }
 
 // word-wraps s into at most maxlines lines of at most width characters; the last line ends in " ..." if cut
@@ -744,8 +828,8 @@ void anticheat(char *arg)
         return;
     }
     int shown = full ? acnumentries : min(acnumentries, AC_TOPN);
-    if(full) conoutf("flagged devices (all %d, most serious first):", acnumentries);
-    else conoutf("flagged devices (top %d of %d, most serious first%s):", shown, acnumentries, acnumentries > shown ? "; /anticheat full for all" : "");
+    if(full) conoutf("flagged devices (all %d, in report.md order: highest confidence first):", acnumentries);
+    else conoutf("flagged devices (top %d of %d, highest confidence first%s):", shown, acnumentries, acnumentries > shown ? "; /anticheat full for all" : "");
     loopi(shown) printentry(acentries[i]);
     conoutf("full explanations: %s\\report.md", acdir);
 }
@@ -754,12 +838,7 @@ COMMAND(anticheat, "s");
 void anticheat_drawhud()
 {
     if(!anticheat_hud || !acinited) return;
-    string line, text;
-    acstatusline(line);
-    // colour: grey without a scan, yellow when something is flagged, red when ANOMALOUS or worse, else white
-    char colour = !acst.valid ? '4' : (acworstrank >= V_ANOMALOUS ? '3' : (acnumflagged ? '2' : '5'));
-    formatstring(text)("\f%c%s", colour, line);
-    draw_text(text, 48, VIRTH * 2 - 9 * FONTH / 8);    // bottom-left, below the equipment icons, opposite "fps"
+    draw_text(achudline, 48, VIRTH * 2 - 9 * FONTH / 8);   // cached once a second; bottom-left, opposite "fps"
 }
 
 #else   // ACGuard is Windows-only; elsewhere the hooks exist and do nothing

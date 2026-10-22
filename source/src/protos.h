@@ -675,7 +675,7 @@ extern void disableraytable();
 extern void computeraytable(float vx, float vy, float fov);
 extern int isoccluded(float vx, float vy, float cx, float cy, float csize);
 
-// anticheat (ACGuard status: reads the ACGuard service's files, see anticheat.h)
+// acguard_client (ACGuard status: reads the ACGuard service's files, see acguard_client.h)
 extern void anticheat_init();
 extern void anticheat_update();
 extern void anticheat_drawhud();

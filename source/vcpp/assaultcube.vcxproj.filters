@@ -31,7 +31,7 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClInclude Include="..\src\anticheat.h">
+    <ClInclude Include="..\src\acguard_client.h">
       <Filter>headers</Filter>
     </ClInclude>
     <ClInclude Include="..\src\command.h">
@@ -314,7 +314,7 @@
     <ClCompile Include="..\src\command.cpp">
       <Filter>support</Filter>
     </ClCompile>
-    <ClCompile Include="..\src\anticheat.cpp">
+    <ClCompile Include="..\src\acguard_client.cpp">
       <Filter>support</Filter>
     </ClCompile>
     <ClCompile Include="..\src\autodownload.cpp">
