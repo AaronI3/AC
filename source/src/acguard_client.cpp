@@ -819,7 +819,7 @@ static int acdemolist[AC_DEMOMAX], acdemocount = 0, acdemodone = 0;   // ACGUARD
 #define AC_FLOODN       5
 #define AC_FLOODMS      60000
 static DWORD acfloodtimes[AC_CANARYN][AC_FLOODN], acflooduntil[AC_CANARYN];
-static int acfloodcount[AC_CANARYN], acfloodsuppressed[AC_CANARYN];
+static int acfloodcount[AC_CANARYN], acfloodsuppressed[AC_CANARYN], acfloodsupdemo[AC_CANARYN];   // supdemo: suppressed events a demo trip made
 static bool acflooding[AC_CANARYN];
 
 // per-block wording (index = block id - 1): where the block is kept, and why a game bug is or is not ruled out
@@ -940,21 +940,22 @@ static bool acappendline(const char *path, const char *line, int len)
     return ok;
 }
 
-static void accanaryevent(CanaryBlock &b, int differ, size_t first, unsigned char expected, unsigned char observed, int flushed = 0);
+static void accanaryevent(CanaryBlock &b, int differ, size_t first, unsigned char expected, unsigned char observed, int flushed = 0, int flusheddemo = 0);
 
 // closes block bi's suppression window once it has expired; the events counted inside it become ONE finding of their
 // own (flushed = the count), so a reader of the file learns the count without waiting for a further event
 static void acfloodexpire(int bi, DWORD now)
 {
     if(!acflooding[bi] || int(now - acflooduntil[bi]) < 0) return;
-    int n = acfloodsuppressed[bi];
+    int n = acfloodsuppressed[bi], nd = acfloodsupdemo[bi];
     acflooding[bi] = false;
     acfloodsuppressed[bi] = 0;
+    acfloodsupdemo[bi] = 0;
     acfloodcount[bi] = 0;                   // a fresh window
-    if(n) accanaryevent(accanary[bi], 0, 0, 0, 0, n);
+    if(n) accanaryevent(accanary[bi], 0, 0, 0, 0, n, nd);
 }
 
-static void accanaryevent(CanaryBlock &b, int differ, size_t first, unsigned char expected, unsigned char observed, int flushed)
+static void accanaryevent(CanaryBlock &b, int differ, size_t first, unsigned char expected, unsigned char observed, int flushed, int flusheddemo)
 {
     int bi = b.id - 1;
     int demo = AC_DEMO_NONE;
@@ -964,7 +965,7 @@ static void accanaryevent(CanaryBlock &b, int differ, size_t first, unsigned cha
     DWORD now = GetTickCount();
     if(acflooding[bi])
     {
-        if(int(now - acflooduntil[bi]) < 0) { accanaryevents[bi]++; acfloodsuppressed[bi]++; return; }   // counted (its event number is skipped), not written
+        if(int(now - acflooduntil[bi]) < 0) { accanaryevents[bi]++; acfloodsuppressed[bi]++; if(demo != AC_DEMO_NONE) acfloodsupdemo[bi]++; return; }   // counted (its event number is skipped), not written
         acfloodexpire(bi, now);             // the count goes out as its own finding first
     }
     int ev = ++accanaryevents[bi];
@@ -990,13 +991,35 @@ static void accanaryevent(CanaryBlock &b, int differ, size_t first, unsigned cha
     {
         formatstring(claim)("Block %d (%s, %d bytes at 0x%08lX) changed %d further time%s in the %d s after its earlier events, as seen by the %d s checks; each change was counted, re-armed and not recorded individually.",
                             b.id, b.where, int(b.n), (unsigned long)(size_t)b.p, flushed, flushed == 1 ? "" : "s", AC_FLOODMS / 1000, AC_CANARYMS / 1000);
-        _snprintf_s(summary, sizeof(summary), _TRUNCATE,
-            "A sentinel block the game keeps %s changed %d further time%s in the %d s after its earlier events (block %d, %s); "
-            "those writes were counted but not written individually. "
-            "Nothing in the game writes this block; a write from outside the process is the only expected cause. "
-            "This canary detects writes only; reads are invisible.",
-            acwherekept[bi], flushed, flushed == 1 ? "" : "s", AC_FLOODMS / 1000, b.id, b.where);
-        conoutf("ACGuard canary: %d further event%s on block %d %s not written in the last %d s", flushed, flushed == 1 ? "" : "s", b.id, flushed == 1 ? "was" : "were", AC_FLOODMS / 1000);
+        string democon;                     // the console's note on how many of the counted writes the demo made itself
+        democon[0] = 0;
+        if(flusheddemo >= flushed)          // every one was the demo's own: an outside write is not the expected cause
+        {
+            copystring(democon, "; all of them made on purpose by the demo");
+            _snprintf_s(summary, sizeof(summary), _TRUNCATE,
+                "A sentinel block the game keeps %s changed %d further time%s in the %d s after its earlier events (block %d, %s); "
+                "all of them were made on purpose by the demo. Those writes were counted but not written individually. "
+                "This canary detects writes only; reads are invisible.",
+                acwherekept[bi], flushed, flushed == 1 ? "" : "s", AC_FLOODMS / 1000, b.id, b.where);
+        }
+        else if(flusheddemo > 0)
+        {
+            formatstring(democon)("; %d of them made on purpose by the demo", flusheddemo);
+            _snprintf_s(summary, sizeof(summary), _TRUNCATE,
+                "A sentinel block the game keeps %s changed %d further time%s in the %d s after its earlier events (block %d, %s); "
+                "%d of them %s made on purpose by the demo (command or setting). Those writes were counted but not written individually. "
+                "Nothing in the game writes this block; a write from outside the process is the only expected cause of the rest. "
+                "This canary detects writes only; reads are invisible.",
+                acwherekept[bi], flushed, flushed == 1 ? "" : "s", AC_FLOODMS / 1000, b.id, b.where, flusheddemo, flusheddemo == 1 ? "was" : "were");
+        }
+        else
+            _snprintf_s(summary, sizeof(summary), _TRUNCATE,
+                "A sentinel block the game keeps %s changed %d further time%s in the %d s after its earlier events (block %d, %s); "
+                "those writes were counted but not written individually. "
+                "Nothing in the game writes this block; a write from outside the process is the only expected cause. "
+                "This canary detects writes only; reads are invisible.",
+                acwherekept[bi], flushed, flushed == 1 ? "" : "s", AC_FLOODMS / 1000, b.id, b.where);
+        conoutf("ACGuard canary: %d further event%s on block %d %s not written in the last %d s%s", flushed, flushed == 1 ? "" : "s", b.id, flushed == 1 ? "was" : "were", AC_FLOODMS / 1000, democon);
     }
     else
     {
