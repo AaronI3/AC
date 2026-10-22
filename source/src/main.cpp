@@ -1505,6 +1505,8 @@ int main(int argc, char **argv)
 
     if(initscript) execute(initscript);
 
+    anticheat_init();   // ACGuard status (read-only); after config load, so anticheat_hud is set
+
     initlog("mainloop");
 
     inputgrab(grabinput = true);
@@ -1554,6 +1556,7 @@ int main(int argc, char **argv)
         totalmillis = millis;
 
         checkinput();
+        anticheat_update();
 
         if(lastmillis) updateworld(curtime, lastmillis);
 

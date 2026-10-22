@@ -845,6 +845,7 @@ void gl_drawhud(int w, int h, int curfps, int nquads, int curvert, bool underwat
     }
     glLoadIdentity();
     glOrtho(0, VIRTW*2, VIRTH*2, 0, -1, 1);
+    anticheat_drawhud();
     extern void r_accuracy(int h);
     extern void *scoremenu;
     extern gmenu *curmenu;

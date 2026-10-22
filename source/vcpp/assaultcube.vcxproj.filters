@@ -31,6 +31,9 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
+    <ClInclude Include="..\src\anticheat.h">
+      <Filter>headers</Filter>
+    </ClInclude>
     <ClInclude Include="..\src\command.h">
       <Filter>headers</Filter>
     </ClInclude>
@@ -309,6 +312,9 @@
       <Filter>game</Filter>
     </ClCompile>
     <ClCompile Include="..\src\command.cpp">
+      <Filter>support</Filter>
+    </ClCompile>
+    <ClCompile Include="..\src\anticheat.cpp">
       <Filter>support</Filter>
     </ClCompile>
     <ClCompile Include="..\src\autodownload.cpp">
