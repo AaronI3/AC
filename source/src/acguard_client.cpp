@@ -957,8 +957,8 @@ static void acfloodexpire(int bi, DWORD now)
 static void accanaryevent(CanaryBlock &b, int differ, size_t first, unsigned char expected, unsigned char observed, int flushed)
 {
     int bi = b.id - 1;
-    int demo = accanarydemo[bi];
-    accanarydemo[bi] = AC_DEMO_NONE;
+    int demo = AC_DEMO_NONE;
+    if(!flushed) { demo = accanarydemo[bi]; accanarydemo[bi] = AC_DEMO_NONE; }   // a flush leaves a pending demo mark for the real event
 
     // flood control
     DWORD now = GetTickCount();
@@ -969,10 +969,14 @@ static void accanaryevent(CanaryBlock &b, int differ, size_t first, unsigned cha
     }
     int ev = ++accanaryevents[bi];
     // the oldest of the last AC_FLOODN events is in the slot about to be overwritten
-    bool floodnow = acfloodcount[bi] >= AC_FLOODN && now - acfloodtimes[bi][acfloodcount[bi] % AC_FLOODN] < DWORD(AC_FLOODMS);
-    acfloodtimes[bi][acfloodcount[bi] % AC_FLOODN] = now;
-    acfloodcount[bi]++;
-    if(floodnow) { acflooding[bi] = true; acflooduntil[bi] = now + AC_FLOODMS; }
+    bool floodnow = false;
+    if(!flushed)                            // a flush finding takes no slot of the fresh window
+    {
+        floodnow = acfloodcount[bi] >= AC_FLOODN && now - acfloodtimes[bi][acfloodcount[bi] % AC_FLOODN] < DWORD(AC_FLOODMS);
+        acfloodtimes[bi][acfloodcount[bi] % AC_FLOODN] = now;
+        acfloodcount[bi]++;
+        if(floodnow) { acflooding[bi] = true; acflooduntil[bi] = now + AC_FLOODMS; }
+    }
 
     SYSTEMTIME st;
     GetSystemTime(&st);
