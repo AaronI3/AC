@@ -22,6 +22,7 @@ int arenaintermission = 0;
 struct serverstate servstate = { 0 };
 
 playerent *player1 = newplayerent();          // our client
+static unsigned char *acguardcanary = anticheat_canaryalloc();    // ACGuard canary block 1: new'd right after player1 (same heap)
 vector<playerent *> players;                  // other clients
 
 int lastmillis = 0, totalmillis = 0, skipmillis = 0;

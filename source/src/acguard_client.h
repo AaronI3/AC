@@ -14,5 +14,8 @@ extern void anticheat_init();       // once from main() after the config is load
 extern void anticheat_update();     // every frame: re-reads status.json and the new tail of findings.jsonl every 1000 ms
 extern void anticheat_drawhud();    // from the HUD pass: one line when anticheat_hud != 0
 extern int anticheat_hud;           // VARP(anticheat_hud, 0, 1, 1)
+extern unsigned char *anticheat_canaryalloc();  // canary block 1, new'd right after player1 (clientgame.cpp)
+// memory canary: three 4096-byte sentinel blocks checked every 2000 ms from anticheat_update(); a change becomes one
+// CAN-001 finding appended to game-findings.jsonl. Console: /anticheat_tripcanary 1|2|3 (demo only).
 
 #endif

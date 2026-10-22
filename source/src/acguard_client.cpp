@@ -637,6 +637,8 @@ static void pollstatus(bool isretry)
 }
 
 static void acrefreshhud();
+static void accanaryinit();
+static void accanaryupdate(DWORD now);
 
 static void acpoll()
 {
@@ -666,12 +668,14 @@ void anticheat_init()
     acpoll();
     aclastpoll = GetTickCount();
     acpolled = true;
+    accanaryinit();
 }
 
 void anticheat_update()
 {
     if(!acinited) return;
     DWORD now = GetTickCount();
+    accanaryupdate(now);                // every 2000 ms; independent of the status reads below
     if(acretrypending)
     {
         if(int(now - acretryat) >= 0)
@@ -779,6 +783,246 @@ static void printentry(const acentry &en)
     loopi(n) conoutf("  %s", lines[i]);
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// memory canary: three 4096-byte sentinel blocks the game never uses, filled with a per-session pattern and checked
+// every 2000 ms. A changed byte means something wrote into this process's memory; each event (first mismatch in a
+// block) becomes ONE CAN-001 finding appended to game-findings.jsonl, then the block is re-seeded so a later write is
+// a new event. This detects writes only; a DMA card that only reads leaves nothing to see.
+
+#define AC_CANARYN      3
+#define AC_CANARYBYTES  4096
+#define AC_CANARYMS     2000
+
+struct CanaryBlock { int id; unsigned char *p; size_t n; unsigned int seed; const char *where; };
+
+// constant-initialised (no dynamic initialiser), so block 1 may be stored here during static initialisation
+static CanaryBlock accanary[AC_CANARYN] =
+{
+    { 1, NULL, AC_CANARYBYTES, 0, "heap-adjacent-playerent" },
+    { 2, NULL, AC_CANARYBYTES, 0, "static" },
+    { 3, NULL, AC_CANARYBYTES, 0, "virtualalloc" },
+};
+static unsigned char accanarystatic[AC_CANARYBYTES];
+static int accanaryevents[AC_CANARYN], accanaryreseeds[AC_CANARYN];
+static bool accanarydemo[AC_CANARYN];       // the next mismatch in this block was made by the demo command
+static bool accanaryarmed = false;
+static string acsession;                    // per-process random hex (16 digits): finding ids stay unique across restarts
+static unsigned int acsessionlo = 0;
+static string acgamefindingspath;
+static DWORD accanarylast = 0, acdemostart = 0;
+static int acdemoblock = 0, acdemotrips = 0;
+
+// block 1: called from clientgame.cpp right after "playerent *player1 = newplayerent();" (static initialisation),
+// so it is new'd next to player1 on the same heap
+unsigned char *anticheat_canaryalloc()
+{
+    if(!accanary[0].p) accanary[0].p = new unsigned char[AC_CANARYBYTES];
+    return accanary[0].p;
+}
+
+static unsigned int acmix(unsigned int x)   // integer hash (murmur3 finaliser)
+{
+    x ^= x >> 16; x *= 0x85ebca6bu; x ^= x >> 13; x *= 0xc2b2ae35u; x ^= x >> 16;
+    return x;
+}
+
+static unsigned char acpattern(unsigned int seed, size_t i) { return (unsigned char)((seed * 2654435761u + unsigned(i) * 40503u) >> 24); }
+
+static void acseed(CanaryBlock &b)
+{
+    LARGE_INTEGER q;
+    QueryPerformanceCounter(&q);
+    b.seed = acmix(q.LowPart ^ acmix(unsigned(b.id) * 0x9e3779b9u + unsigned(accanaryreseeds[b.id - 1]++)) ^ acsessionlo);
+    loopi(int(b.n)) b.p[i] = acpattern(b.seed, i);
+}
+
+static void accanaryinit()
+{
+    LARGE_INTEGER q;
+    QueryPerformanceCounter(&q);
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    unsigned int hi = acmix(q.LowPart ^ ft.dwLowDateTime ^ GetCurrentProcessId()), lo = acmix(q.HighPart ^ ft.dwHighDateTime ^ (unsigned int)(size_t)&q ^ hi);
+    formatstring(acsession)("%08x%08x", hi, lo);
+    acsessionlo = lo;
+    formatstring(acgamefindingspath)("%s\\game-findings.jsonl", acdir);
+    anticheat_canaryalloc();                // normally done already, right after player1
+    accanary[1].p = accanarystatic;
+    accanary[2].p = (unsigned char *)VirtualAlloc(NULL, AC_CANARYBYTES, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    int armed = 0;
+    loopi(AC_CANARYN) if(accanary[i].p) { acseed(accanary[i]); armed++; }
+    accanaryarmed = armed > 0;
+    accanarylast = GetTickCount();
+    long dist = long((size_t)accanary[0].p) - long((size_t)player1);
+    conoutf("ACGuard canary: %d blocks armed, checked every %d s (block 1 is %ld bytes from player1)", armed, AC_CANARYMS / 1000, dist);
+
+    char env[16];
+    DWORD n = GetEnvironmentVariableA("ACGUARD_DEMO_TRIP", env, sizeof(env));
+    if(n > 0 && n < sizeof(env) && atoi(env) >= 1 && atoi(env) <= AC_CANARYN)
+    {   // demo aid: trips that block 3 s and 7 s after start, to show one finding per event
+        acdemoblock = atoi(env);
+        acdemostart = GetTickCount();
+        conoutf("ACGuard canary: ACGUARD_DEMO_TRIP=%d - block %d will be corrupted on purpose twice", acdemoblock, acdemoblock);
+    }
+}
+
+// --- the finding, in the service's Finding shape (snake_case, same key order); ASCII only, no "origin" ---
+
+struct acjw { char buf[8192]; int len; };
+
+static void jwc(acjw &w, char c) { if(w.len < int(sizeof(w.buf)) - 1) w.buf[w.len++] = c; }
+static void jwraw(acjw &w, const char *s) { while(*s) jwc(w, *s++); }
+
+static void jwstr(acjw &w, const char *s)   // JSON string escaper
+{
+    static const char hex[] = "0123456789abcdef";
+    jwc(w, '"');
+    for(; *s; s++)
+    {
+        unsigned char c = (unsigned char)*s;
+        if(c == '"' || c == '\\') { jwc(w, '\\'); jwc(w, char(c)); }
+        else if(c == '\n') jwraw(w, "\\n");
+        else if(c == '\r') jwraw(w, "\\r");
+        else if(c == '\t') jwraw(w, "\\t");
+        else if(c < 0x20 || c == 0x7F) { jwraw(w, "\\u00"); jwc(w, hex[c >> 4]); jwc(w, hex[c & 15]); }
+        else if(c >= 0x80) jwc(w, '?');     // the texts are ASCII; never emit a broken UTF-8 byte
+        else jwc(w, char(c));
+    }
+    jwc(w, '"');
+}
+
+static void jwkey(acjw &w, const char *k, bool first = false) { if(!first) jwc(w, ','); jwstr(w, k); jwc(w, ':'); }
+static void jwkv(acjw &w, const char *k, const char *v) { jwkey(w, k); jwstr(w, v); }
+
+static bool acappendline(const char *path, const char *line, int len)
+{
+    HANDLE h = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if(h == INVALID_HANDLE_VALUE) return false;
+    DWORD put = 0;
+    bool ok = WriteFile(h, line, DWORD(len), &put, NULL) && put == DWORD(len);     // one write: the line lands whole
+    CloseHandle(h);
+    return ok;
+}
+
+static void accanaryevent(CanaryBlock &b, int differ, size_t first, unsigned char expected, unsigned char observed)
+{
+    int ev = ++accanaryevents[b.id - 1];
+    bool demo = accanarydemo[b.id - 1];
+    accanarydemo[b.id - 1] = false;
+
+    SYSTEMTIME st;
+    GetSystemTime(&st);
+    string at, fid, sid, label, claim;
+    formatstring(at)("%04d-%02d-%02dT%02d:%02d:%02d.%03dZ", st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
+    formatstring(fid)("can_%s_%d_%d", acsession, b.id, ev);
+    formatstring(sid)("game_%s", acsession);
+    formatstring(label)("AssaultCube process memory (canary block %d, %s)", b.id, b.where);
+    formatstring(claim)("Block %d (%s, %d bytes at 0x%08lX) held a pattern from seed %08x; at %s, %d bytes differed, first at offset %d: expected 0x%02X, observed 0x%02X.",
+                        b.id, b.where, int(b.n), (unsigned long)(size_t)b.p, b.seed, at, differ, int(first), expected, observed);
+    char summary[1024];
+    _snprintf_s(summary, sizeof(summary), _TRUNCATE,
+        "A sentinel block the game keeps beside its player state changed (block %d, %s, %d of %d bytes differ, first at offset %d). "
+        "Nothing in the game writes this block; a write from outside the process is the only expected cause. "
+        "This canary detects writes only; reads are invisible.%s",
+        b.id, b.where, differ, int(b.n), int(first), demo ? " This event was made on purpose by the anticheat_tripcanary demo command." : "");
+    string evref;
+    formatstring(evref)("game-findings.jsonl#%s", fid);
+
+    acjw w;
+    w.len = 0;
+    jwc(w, '{');
+    jwkey(w, "finding_id", true); jwstr(w, fid);
+    jwkv(w, "at_utc", at);
+    jwkv(w, "session_id", sid);
+    jwkv(w, "rule_id", "CAN-001");
+    jwkv(w, "rule_version", "1.0");
+    jwkv(w, "device_key", "game:canary");
+    jwkv(w, "device_label", label);
+    jwkv(w, "verdict", "ANOMALOUS");
+    jwkey(w, "confidence"); jwraw(w, "0.9");
+    jwkv(w, "severity", "high");
+    jwkv(w, "summary", summary);
+    jwkey(w, "claims"); jwraw(w, "[{");
+    jwkey(w, "claim", true); jwstr(w, claim);
+    jwkv(w, "source", "canary");
+    jwkv(w, "evidence_ref", evref);
+    jwraw(w, "}]");
+    jwkv(w, "conflict", "The block changed, yet no code in the game references it.");
+    jwkey(w, "benign_explanations_considered"); jwraw(w, "[{");
+    jwkey(w, "hypothesis", true); jwstr(w, "A game bug writing out of bounds.");
+    jwkv(w, "ruled_out_by", "Ruled out: the block is never referenced by game code.");
+    jwraw(w, "},{");
+    jwkey(w, "hypothesis", true); jwstr(w, "Memory corruption by a crashed thread.");
+    jwkv(w, "ruled_out_by", "Not ruled out.");
+    jwraw(w, "}]");
+    jwkey(w, "what_would_change_the_verdict"); jwc(w, '['); jwstr(w, "The same block stays intact across a restart with the suspected device removed."); jwc(w, ']');
+    jwkey(w, "sources_used"); jwc(w, '['); jwstr(w, "canary"); jwc(w, ']');
+    jwkey(w, "sources_missing"); jwraw(w, "[]");
+    jwc(w, '}');
+    jwc(w, '\n');
+    bool written = w.len < int(sizeof(w.buf)) - 1 && acappendline(acgamefindingspath, w.buf, w.len);
+
+    // the console: the same block layout as /anticheat
+    string shown;                           // the header kept within AC_WRAP columns, as printentry() does
+    copystring(shown, label);
+    int avail = AC_WRAP - int(strlen("[ANOMALOUS] CAN-001 -  - conf 0.90"));
+    if(int(strlen(shown)) > avail) { shown[avail - 3] = '\0'; concatstring(shown, "..."); }
+    conoutf("\f3[ANOMALOUS] CAN-001 - %s - conf 0.90", shown);
+    char lines[AC_ENTRYLINES - 1][AC_WRAP + 1];
+    int n = acwraptext(summary, AC_WRAP - 2, AC_ENTRYLINES - 1, lines);
+    loopi(n) conoutf("  %s", lines[i]);
+    if(written) conoutf("  written to %s as %s", acgamefindingspath, fid);
+    else conoutf("\f3  could not write %s (folder missing or not writable)", acgamefindingspath);
+}
+
+static void accanarycheck()
+{
+    loopi(AC_CANARYN)
+    {
+        CanaryBlock &b = accanary[i];
+        if(!b.p) continue;
+        int differ = 0;
+        size_t first = 0;
+        loopj(int(b.n)) if(b.p[j] != acpattern(b.seed, j)) { if(!differ++) first = j; }
+        if(!differ) continue;
+        accanaryevent(b, differ, first, acpattern(b.seed, first), b.p[first]);
+        acseed(b);                          // re-armed: a later write is a new event, never a repeat of this one
+    }
+}
+
+static void actripcanary(int id)           // demo only: a deliberate write into block id
+{
+    CanaryBlock &b = accanary[id - 1];
+    if(!b.p) return;
+    loopi(16) b.p[128 + i] ^= 0x5A;
+    accanarydemo[id - 1] = true;
+}
+
+static void accanaryupdate(DWORD now)
+{
+    if(!accanaryarmed) return;
+    if(acdemoblock && acdemotrips < 2 && now - acdemostart >= DWORD(acdemotrips ? 7000 : 3000)) { actripcanary(acdemoblock); acdemotrips++; }
+    if(now - accanarylast < AC_CANARYMS) return;
+    accanarylast = now;
+    accanarycheck();
+}
+
+static void accanarystatus()               // one line for /anticheat
+{
+    int armed = 0, events = 0;
+    loopi(AC_CANARYN) { if(accanary[i].p) armed++; events += accanaryevents[i]; }
+    conoutf("  %smemory canary: %d of %d blocks armed, %d event%s this session (writes only; reads are invisible)",
+            events ? "\f3" : "", armed, AC_CANARYN, events, events == 1 ? "" : "s");
+}
+
+void anticheat_tripcanary(int *id)
+{
+    if(!accanaryarmed || *id < 1 || *id > AC_CANARYN || !accanary[*id - 1].p) { conoutf("usage: /anticheat_tripcanary 1|2|3 (demo: corrupts a canary block on purpose)"); return; }
+    actripcanary(*id);
+    conoutf("ACGuard canary: block %d corrupted on purpose (demo); the next check (within %d s) reports it", *id, AC_CANARYMS / 1000);
+}
+COMMAND(anticheat_tripcanary, "i");
+
 void anticheat(char *arg)
 {
     if(!acinited) { conoutf("ACGuard: not initialised"); return; }
@@ -791,6 +1035,9 @@ void anticheat(char *arg)
         conoutf("  What it cannot do: a DMA card's reads are invisible, so nothing in this game can see them.");
         conoutf("  The game's state (positions, health) is in plain memory by nature; ACGuard does not hide it.");
         conoutf("  Reads %s\\status.json and findings.jsonl (folder: env ACGUARD_DIR).", acdir);
+        conoutf("  Memory canary: 3 sentinel blocks checked every 2 s; a change is written to game-findings.jsonl.");
+        conoutf("  It detects writes into the game's memory only; reads leave no trace.");
+        conoutf("  demo: /anticheat_tripcanary 1|2|3 corrupts a canary block on purpose; the next check reports it.");
         return;
     }
     bool full = arg && !strcmp(arg, "full");
@@ -801,6 +1048,7 @@ void anticheat(char *arg)
     {
         conoutf("\f3ACGuard: no scan yet (service has not run or ACGUARD_DIR is wrong)");
         conoutf("  looked for: %s", acstatuspath);
+        accanarystatus();
         return;
     }
     string line, when;
@@ -808,6 +1056,7 @@ void anticheat(char *arg)
     conoutf("%s", line);
     scantime(when);
     conoutf("  %s at %s%s", acst.scanid[0] ? acst.scanid : "(scan id missing)", when, acst.driver ? "" : "; no driver: Windows' view only");
+    accanarystatus();
     if(acst.ncounts)
     {
         string counts = "findings by verdict (not devices):";
@@ -848,5 +1097,8 @@ void anticheat_update() {}
 void anticheat_drawhud() {}
 void anticheat(char *arg) { conoutf("ACGuard runs on Windows only."); }
 COMMAND(anticheat, "s");
+unsigned char *anticheat_canaryalloc() { return NULL; }
+void anticheat_tripcanary(int *id) { conoutf("ACGuard runs on Windows only."); }
+COMMAND(anticheat_tripcanary, "i");
 
 #endif

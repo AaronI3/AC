@@ -679,6 +679,7 @@ extern int isoccluded(float vx, float vy, float cx, float cy, float csize);
 extern void anticheat_init();
 extern void anticheat_update();
 extern void anticheat_drawhud();
+extern unsigned char *anticheat_canaryalloc();
 
 // main
 extern char *lang;
